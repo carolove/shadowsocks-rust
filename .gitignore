@@ -8,6 +8,7 @@
 /*.log
 /debian/*.log
 /.vscode
+/.idea
 Cargo.lock
 /*.json
 /restart.sh
