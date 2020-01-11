@@ -13,12 +13,6 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    config::{ConfigType, ServerAddr, ServerConfig},
-    context::Context,
-    relay::{socks5::Address, utils::try_timeout},
-};
-
 use bytes::BytesMut;
 use futures::{future::FusedFuture, ready, select, Future};
 use log::{debug, error, trace};
@@ -27,6 +21,12 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
     net::TcpStream,
     time::{self, Delay},
+};
+
+use crate::{
+    config::{ConfigType, ServerAddr, ServerConfig},
+    context::Context,
+    relay::{socks5::Address, utils::try_timeout},
 };
 
 mod aead;
@@ -198,35 +198,33 @@ async fn connect_proxy_server_internal(
     match svr_addr {
         ServerAddr::SocketAddr(ref addr) => {
             let stream = try_timeout(TcpStream::connect(addr), timeout).await?;
+            debug!("Connected proxy {}", addr);
             Ok(STcpStream::new(stream, timeout))
         }
         ServerAddr::DomainName(ref domain, port) => {
-            use crate::relay::dns_resolver::resolve;
-
-            let vec_ipaddr = try_timeout(resolve(context, &domain[..], *port, false), timeout).await?;
-
-            assert!(!vec_ipaddr.is_empty());
-
-            let mut last_err: Option<io::Error> = None;
-            for addr in &vec_ipaddr {
+            let result = lookup_then!(context, domain.as_str(), *port, false, |addr| {
                 match try_timeout(TcpStream::connect(addr), timeout).await {
-                    Ok(s) => return Ok(STcpStream::new(s, timeout)),
+                    Ok(s) => Ok(STcpStream::new(s, timeout)),
                     Err(e) => {
-                        error!(
-                            "Failed to connect {}:{}, resolved address {}, try another (err: {})",
+                        debug!(
+                            "Failed to connect proxy {}:{} ({}), try another (err: {})",
                             domain, port, addr, e
                         );
-                        last_err = Some(e);
+                        Err(e)
                     }
                 }
-            }
+            });
 
-            let err = last_err.unwrap();
-            error!(
-                "Failed to connect {}:{}, tried all addresses but still failed (last err: {})",
-                domain, port, err
-            );
-            Err(err)
+            match result {
+                Ok((addr, s)) => {
+                    debug!("Connected proxy {}:{} ({})", domain, port, addr);
+                    Ok(s)
+                }
+                Err(err) => {
+                    error!("Failed to connect proxy {}:{}, {}", domain, port, err);
+                    Err(err)
+                }
+            }
         }
     }
 }
@@ -279,11 +277,12 @@ async fn connect_proxy_server(context: &Context, svr_cfg: &ServerConfig) -> io::
 
 /// Handshake logic for ShadowSocks Client
 pub async fn proxy_server_handshake(
+    context: &Context,
     remote_stream: STcpStream,
     svr_cfg: &ServerConfig,
     relay_addr: &Address,
 ) -> io::Result<CryptoStream<STcpStream>> {
-    let mut stream = CryptoStream::new(remote_stream, svr_cfg);
+    let mut stream = CryptoStream::new(context, remote_stream, svr_cfg);
 
     trace!("Got encrypt stream and going to send addr: {:?}", relay_addr);
 

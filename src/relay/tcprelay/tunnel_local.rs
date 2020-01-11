@@ -44,7 +44,7 @@ async fn establish_client_tcp_tunnel<'a>(
         }
     };
 
-    let mut svr_s = super::proxy_server_handshake(svr_s, svr_cfg, addr).await?;
+    let mut svr_s = super::proxy_server_handshake(context, svr_s, svr_cfg, addr).await?;
     let (mut svr_r, mut svr_w) = svr_s.split();
 
     let (mut r, mut w) = s.split();
@@ -141,9 +141,10 @@ pub async fn run(context: SharedContext) -> io::Result<()> {
         "You must enable TCP relay for tunneling"
     );
 
-    let local_addr = *context.config().local.as_ref().expect("Missing local config");
+    let local_addr = context.config().local.as_ref().expect("Missing local config");
+    let bind_addr = local_addr.bind_addr(&*context).await?;
 
-    let mut listener = TcpListener::bind(&local_addr)
+    let mut listener = TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|err| panic!("Failed to listen on {}, {}", local_addr, err));
 

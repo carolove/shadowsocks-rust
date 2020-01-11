@@ -1,77 +1,48 @@
-use std::io::{self, ErrorKind};
-use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
+use std::{
+    io::{self, Error, ErrorKind},
+    net::SocketAddr,
+};
 
-use log::{debug, error};
+use log::debug;
+use tokio::net::lookup_host;
 
-use crate::context::SharedContext;
+use crate::context::Context;
 
-/// Resolve address to IP
-#[cfg(not(feature = "single-threaded"))]
+/// Perform a DNS resolution
 pub async fn resolve(
-    context: SharedContext,
+    context: &Context,
     addr: &str,
     port: u16,
     check_forbidden: bool,
-) -> io::Result<Vec<SocketAddr>> {
-    use tokio::task::spawn_blocking;
+) -> io::Result<impl Iterator<Item = SocketAddr>> {
+    match lookup_host((addr, port)).await {
+        Err(err) => {
+            let err = Error::new(ErrorKind::Other, format!("dns resolve {}:{}, {}", addr, port, err));
+            Err(err)
+        }
+        Ok(addrs) => {
+            let mut vaddr = Vec::new();
+            for addr in addrs {
+                let ip = addr.ip();
 
-    let addr = addr.to_owned();
-    spawn_blocking(move || {
-        let mut vaddr = Vec::new();
-        for addr in (addr.as_str(), port).to_socket_addrs()? {
-            let ip = addr.ip();
-
-            if check_forbidden {
-                let forbidden_ip = &context.config().forbidden_ip;
-                if forbidden_ip.contains(&ip) {
+                if check_forbidden && context.check_forbidden_ip(&ip) {
                     debug!("Resolved {} => {}, which is skipped by forbidden_ip", addr, ip);
                     continue;
                 }
+
+                vaddr.push(addr);
             }
-            vaddr.push(addr);
-        }
 
-        if vaddr.is_empty() {
-            error!("Failed to resolve {}:{}, all IPs are filtered", addr, port);
-            let err = io::Error::new(ErrorKind::Other, "resolved to empty address, all IPs are filtered");
-            Err(err)
-        } else {
-            debug!("Resolved {}:{} => {:?}", addr, port, vaddr);
-            Ok(vaddr)
-        }
-    })
-    .await?
-}
-
-/// Resolve address to IP
-#[cfg(feature = "single-threaded")]
-pub async fn resolve(
-    context: SharedContext,
-    addr: &str,
-    port: u16,
-    check_forbidden: bool,
-) -> io::Result<Vec<SocketAddr>> {
-    let mut vaddr = Vec::new();
-    for addr in (addr, port).to_socket_addrs()? {
-        let ip = addr.ip();
-
-        if check_forbidden {
-            let forbidden_ip = &context.config().forbidden_ip;
-            if forbidden_ip.contains(&ip) {
-                debug!("Resolved {} => {}, which is skipped by forbidden_ip", addr, ip);
-                continue;
+            if vaddr.is_empty() {
+                let err = Error::new(
+                    ErrorKind::Other,
+                    format!("resolved {}:{}, but all IPs are filtered", addr, port),
+                );
+                Err(err)
+            } else {
+                debug!("Resolved {}:{} => {:?}", addr, port, vaddr);
+                Ok(vaddr.into_iter())
             }
         }
-        vaddr.push(addr);
-    }
-
-    if vaddr.is_empty() {
-        error!("Failed to resolve {}:{}, all IPs are filtered", addr, port);
-        let err = io::Error::new(ErrorKind::Other, "resolved to empty address, all IPs are filtered");
-        Err(err)
-    } else {
-        debug!("Resolved {}:{} => {:?}", addr, port, vaddr);
-        Ok(vaddr)
     }
 }

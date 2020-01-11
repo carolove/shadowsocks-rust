@@ -60,20 +60,16 @@ impl ServerClient {
         send_buf.extend_from_slice(payload);
 
         let mut encrypt_buf = BytesMut::new();
-        encrypt_payload(self.method, &self.key, &send_buf, &mut encrypt_buf)?;
+        encrypt_payload(context, self.method, &self.key, &send_buf, &mut encrypt_buf)?;
 
         let send_len = match self.server_addr {
             ServerAddr::SocketAddr(ref remote_addr) => {
                 try_timeout(self.socket.send_to(&encrypt_buf[..], remote_addr), Some(timeout)).await?
             }
-            ServerAddr::DomainName(ref dname, port) => {
-                use crate::relay::dns_resolver::resolve;
-
-                let vec_ipaddr = resolve(context, dname, port, false).await?;
-                assert!(!vec_ipaddr.is_empty());
-
-                try_timeout(self.socket.send_to(&encrypt_buf[..], &vec_ipaddr[0]), Some(timeout)).await?
-            }
+            ServerAddr::DomainName(ref dname, port) => lookup_then!(context, dname, port, false, |addr| {
+                try_timeout(self.socket.send_to(&encrypt_buf[..], addr), Some(timeout)).await
+            })
+            .map(|(_, l)| l)?,
         };
 
         assert_eq!(encrypt_buf.len(), send_len);
@@ -90,7 +86,7 @@ impl ServerClient {
         let mut recv_buf = [0u8; MAXIMUM_UDP_PAYLOAD_SIZE];
         let (recv_n, ..) = try_timeout(self.socket.recv_from(&mut recv_buf), Some(timeout)).await?;
 
-        let decrypt_buf = match decrypt_payload(self.method, &self.key, &recv_buf[..recv_n])? {
+        let decrypt_buf = match decrypt_payload(context, self.method, &self.key, &recv_buf[..recv_n])? {
             None => {
                 error!("UDP packet too short, received length {}", recv_n);
                 let err = io::Error::new(io::ErrorKind::InvalidData, "packet too short");

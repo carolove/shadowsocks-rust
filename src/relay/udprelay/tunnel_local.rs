@@ -60,11 +60,12 @@ impl UdpAssociation {
         src_addr: SocketAddr,
         mut response_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     ) -> io::Result<UdpAssociation> {
-        debug!("Created UDP Association for {}", src_addr);
-
         // Create a socket for receiving packets
         let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
         let remote_udp = create_socket(&local_addr).await?;
+
+        let local_addr = remote_udp.local_addr().expect("Could not determine port bound to");
+        debug!("Created UDP Association for {} from {}", src_addr, local_addr);
 
         // Create a channel for sending packets to remote
         // FIXME: Channel size 1024?
@@ -82,13 +83,14 @@ impl UdpAssociation {
 
         // local -> remote
         let c_svr_cfg = svr_cfg.clone();
+        let c_context = context.clone();
         tokio::spawn(async move {
             let svr_cfg = c_svr_cfg.server_config();
 
             while let Some(pkt) = rx.recv().await {
                 // pkt is already a raw packet, so just send it
                 if let Err(err) =
-                    UdpAssociation::relay_l2r(&*context, src_addr, &mut sender, &pkt[..], timeout, svr_cfg).await
+                    UdpAssociation::relay_l2r(&*c_context, src_addr, &mut sender, &pkt[..], timeout, svr_cfg).await
                 {
                     error!("failed to send packet {} -> ..., error: {}", src_addr, err);
 
@@ -106,7 +108,8 @@ impl UdpAssociation {
             let transfer_fut = async move {
                 loop {
                     // Read and send back to source
-                    match UdpAssociation::relay_r2l(src_addr, &mut receiver, &mut response_tx, svr_cfg).await {
+                    match UdpAssociation::relay_r2l(&*context, src_addr, &mut receiver, &mut response_tx, svr_cfg).await
+                    {
                         Ok(..) => {}
                         Err(err) => {
                             error!("failed to receive packet, {} <- .., error: {}", src_addr, err);
@@ -149,20 +152,16 @@ impl UdpAssociation {
         send_buf.extend_from_slice(payload);
 
         let mut encrypt_buf = BytesMut::new();
-        encrypt_payload(svr_cfg.method(), svr_cfg.key(), &send_buf, &mut encrypt_buf)?;
+        encrypt_payload(context, svr_cfg.method(), svr_cfg.key(), &send_buf, &mut encrypt_buf)?;
 
         let send_len = match svr_cfg.addr() {
             ServerAddr::SocketAddr(ref remote_addr) => {
                 try_timeout(remote_udp.send_to(&encrypt_buf[..], remote_addr), Some(timeout)).await?
             }
-            ServerAddr::DomainName(ref dname, port) => {
-                use crate::relay::dns_resolver::resolve;
-
-                let vec_ipaddr = resolve(context, dname, *port, false).await?;
-                assert!(!vec_ipaddr.is_empty());
-
-                try_timeout(remote_udp.send_to(&encrypt_buf[..], &vec_ipaddr[0]), Some(timeout)).await?
-            }
+            ServerAddr::DomainName(ref dname, port) => lookup_then!(context, dname, *port, false, |addr| {
+                try_timeout(remote_udp.send_to(&encrypt_buf[..], &addr), Some(timeout)).await
+            })
+            .map(|(_, l)| l)?,
         };
 
         assert_eq!(encrypt_buf.len(), send_len);
@@ -172,6 +171,7 @@ impl UdpAssociation {
 
     /// Relay packets from remote to local
     async fn relay_r2l(
+        context: &Context,
         src_addr: SocketAddr,
         remote_udp: &mut RecvHalf,
         response_tx: &mut mpsc::Sender<(SocketAddr, Vec<u8>)>,
@@ -183,7 +183,7 @@ impl UdpAssociation {
 
         let (recv_n, remote_addr) = remote_udp.recv_from(&mut recv_buf).await?;
 
-        let decrypt_buf = match decrypt_payload(svr_cfg.method(), svr_cfg.key(), &recv_buf[..recv_n])? {
+        let decrypt_buf = match decrypt_payload(context, svr_cfg.method(), svr_cfg.key(), &recv_buf[..recv_n])? {
             None => {
                 error!("UDP packet too short, received length {}", recv_n);
                 let err = io::Error::new(io::ErrorKind::InvalidData, "packet too short");
@@ -258,9 +258,11 @@ impl PingServer for ServerScore {
 
 /// Starts a UDP local server
 pub async fn run(context: SharedContext) -> io::Result<()> {
-    let local_addr = *context.config().local.as_ref().unwrap();
+    let local_addr = context.config().local.as_ref().expect("Missing local config");
+    let bind_addr = local_addr.bind_addr(&*context).await?;
 
-    let l = create_socket(&local_addr).await?;
+    let l = create_socket(&bind_addr).await?;
+    let local_addr = l.local_addr().expect("Could not determine port bound to");
 
     let servers = context.config().server.iter().map(ServerScore::new).collect();
     let mut balancer = PingBalancer::new(context.clone(), servers, PingServerType::Udp).await;

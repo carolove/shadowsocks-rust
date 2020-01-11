@@ -32,7 +32,9 @@ async fn handle_client(
         error!("Failed to set keep alive: {:?}", err);
     }
 
-    if svr_context.context().config().no_delay {
+    let context = svr_context.context();
+
+    if context.config().no_delay {
         if let Err(err) = socket.set_nodelay(true) {
             error!("Failed to set no delay: {:?}", err);
         }
@@ -51,7 +53,7 @@ async fn handle_client(
 
     // Do server-client handshake
     // Perform encryption IV exchange
-    let mut stream = CryptoStream::new(stream, svr_context.svr_cfg());
+    let mut stream = CryptoStream::new(context, stream, svr_context.svr_cfg());
 
     // Read remote Address
     let remote_addr = match Address::read_from(&mut stream).await {
@@ -69,11 +71,17 @@ async fn handle_client(
 
     let context = svr_context.context();
 
-    let bind_addr = &context.config().local;
+    let bind_addr = match context.config().local {
+        None => None,
+        Some(ref addr) => {
+            let ba = addr.bind_addr(context).await?;
+            Some(ba)
+        }
+    };
 
     let mut remote_stream = match remote_addr {
         Address::SocketAddress(ref saddr) => {
-            if context.config().forbidden_ip.contains(&saddr.ip()) {
+            if context.check_forbidden_ip(&saddr.ip()) {
                 error!("{} is forbidden, failed to connect {}", saddr.ip(), saddr);
                 let err = io::Error::new(
                     io::ErrorKind::Other,
@@ -82,7 +90,7 @@ async fn handle_client(
                 return Err(err);
             }
 
-            match connect_tcp_stream(saddr, bind_addr).await {
+            match connect_tcp_stream(saddr, &bind_addr).await {
                 Ok(s) => {
                     debug!("Connected to remote {}", saddr);
                     s
@@ -94,40 +102,27 @@ async fn handle_client(
             }
         }
         Address::DomainNameAddress(ref dname, port) => {
-            use crate::relay::dns_resolver::resolve;
-
-            let addrs = match resolve(&*context, dname.as_str(), port, true).await {
-                Ok(r) => r,
-                Err(err) => {
-                    error!("Failed to resolve {}, {}", dname, err);
-                    return Err(err);
-                }
-            };
-
-            let mut last_err: Option<io::Error> = None;
-            let mut stream_opt = None;
-            for addr in &addrs {
-                match connect_tcp_stream(addr, bind_addr).await {
-                    Ok(s) => stream_opt = Some(s),
+            let result = lookup_then!(&*context, dname.as_str(), port, true, |addr| {
+                match connect_tcp_stream(&addr, &bind_addr).await {
+                    Ok(s) => Ok(s),
                     Err(err) => {
-                        error!(
+                        debug!(
                             "Failed to connect remote {}:{} (resolved: {}), {}, try others",
                             dname, port, addr, err
                         );
-                        last_err = Some(err);
+                        Err(err)
                     }
                 }
-            }
+            });
 
-            match stream_opt {
-                Some(s) => {
-                    debug!("Connected to remote {}:{}", dname, port);
+            match result {
+                Ok((addr, s)) => {
+                    trace!("Connected remote {}:{} (resolved: {})", dname, port, addr);
                     s
                 }
-                None => {
-                    let err = last_err.unwrap();
+                Err(err) => {
                     error!("Failed to connect remote {}:{}, {}", dname, port, err);
-                    return Err(io::Error::new(io::ErrorKind::Other, err));
+                    return Err(err);
                 }
             }
         }
@@ -165,13 +160,15 @@ pub async fn run(context: SharedContext) -> io::Result<()> {
     for svr_cfg in &context.config().server {
         let mut listener = {
             let addr = svr_cfg.plugin_addr().as_ref().unwrap_or_else(|| svr_cfg.addr());
-            let addr = addr.listen_addr();
+            let addr = addr.bind_addr(&*context).await?;
 
             let listener = TcpListener::bind(&addr)
                 .await
-                .unwrap_or_else(|err| panic!("Failed to listen, {}", err));
+                .unwrap_or_else(|err| panic!("Failed to listen on {}, {}", addr, err));
 
-            info!("ShadowSocks TCP Listening on {}", addr);
+            let local_addr = listener.local_addr().expect("Could not determine port bound to");
+            info!("ShadowSocks TCP Listening on {}", local_addr);
+
             listener
         };
 
