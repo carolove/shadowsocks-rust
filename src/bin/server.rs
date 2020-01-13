@@ -7,6 +7,8 @@
 //! *It should be notice that the extented configuration file is not suitable for the server
 //! side.*
 
+use std::net::{IpAddr, SocketAddr};
+
 use clap::{App, Arg};
 use futures::{
     future::{self, Either},
@@ -91,6 +93,13 @@ fn main() {
                 .takes_value(true)
                 .help("ShadowSocks Manager (ssmgr) address"),
         )
+        .arg(
+            Arg::with_name("NOFILE")
+                .short("n")
+                .long("nofile")
+                .takes_value(true)
+                .help("Set RLIMIT_NOFILE with both soft and hard limit (only for *nix systems)"),
+        )
         .get_matches();
 
     let debug_level = matches.occurrences_of("VERBOSE");
@@ -153,9 +162,10 @@ fn main() {
     }
 
     if let Some(bind_addr) = matches.value_of("BIND_ADDR") {
-        let bind_addr = bind_addr
-            .parse::<ServerAddr>()
-            .expect("`bind-addr` invalid, (IP:Port) or (Domain:Port)");
+        let bind_addr = match bind_addr.parse::<IpAddr>() {
+            Ok(ip) => ServerAddr::from(SocketAddr::new(ip, 0)),
+            Err(..) => ServerAddr::from((bind_addr, 0)),
+        };
 
         config.local = Some(bind_addr);
     }
@@ -191,7 +201,15 @@ fn main() {
     if let Some(m) = matches.value_of("MANAGER_ADDRESS") {
         config.manager_address = Some(
             m.parse::<ServerAddr>()
-                .expect("Expecting a valid ServerAddr for manager_address"),
+                .expect("Expecting \"IP:Port\" or \"Domain:Port\" for `manager_address`"),
+        );
+    }
+
+    if let Some(nofile) = matches.value_of("NOFILE") {
+        config.nofile = Some(
+            nofile
+                .parse::<u64>()
+                .expect("Expecting an unsigned integer for `nofile`"),
         );
     }
 
